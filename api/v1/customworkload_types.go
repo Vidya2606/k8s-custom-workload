@@ -32,7 +32,7 @@ type CustomWorkloadSpec struct {
 	// Replicas is the desired number of pods
 	Replicas int32 `json:"replicas"`
 
-	// Partition determines how many pods should be updated during a rolling update
+	// Partition determines how many pods should be updated if the template changes
 	Partition int32 `json:"partition,omitempty"`
 
 	// Template defines the pod template
