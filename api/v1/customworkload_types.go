@@ -35,8 +35,11 @@ type CustomWorkloadSpec struct {
 	// Partition determines how many pods should be updated if the template changes
 	Partition int32 `json:"partition,omitempty"`
 
-	// Template defines the pod template
+	// Template defines the pod spec
 	Template corev1.PodTemplateSpec `json:"template"`
+
+	// RevisionHistoryLimit is the limit on Controller Revision history length
+	RevisionHistoryLimit int32 `json:"revisionHistoryLimit,omitempty"`
 }
 
 // CustomWorkloadStatus defines the observed state of CustomWorkload.
