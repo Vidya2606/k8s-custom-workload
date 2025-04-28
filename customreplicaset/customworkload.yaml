@@ -1,0 +1,16 @@
+apiVersion: apps.example.com/v1
+kind: CustomWorkload
+metadata:
+  name: customworkload
+  namespace: default
+spec:
+  replicas: 3
+  partition: 1
+  revisionHistoryLimit: 1
+  template:
+    spec:
+      containers:
+        - name: web
+          image: nginx
+          ports:
+            - containerPort: 80

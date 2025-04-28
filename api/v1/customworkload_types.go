@@ -36,6 +36,7 @@ type CustomWorkloadSpec struct {
 	Partition int32 `json:"partition,omitempty"`
 
 	// Template defines the pod spec
+	// +kubebuilder:validation:PreserveUnknownFields
 	Template corev1.PodTemplateSpec `json:"template"`
 
 	// RevisionHistoryLimit is the limit on Controller Revision history length
