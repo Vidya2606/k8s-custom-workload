@@ -18,6 +18,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"github.com/go-logr/logr"
 	appsv1 "github.com/vidya2606/k8s-custom-workload/api/v1"
@@ -67,26 +70,18 @@ func (r *CustomWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{Requeue: false}, err
 	}
 
-	if err := r.managePods(ctx, &workload, childPods, log); err != nil {
+	// Calculate hash of the latest template
+	templateHash, err := calculateTemplateHash(workload.Spec.Template)
+	if err != nil {
+		log.Error(err, "Failed to calculate template hash")
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	// Create or update template revision
-	//latestRevision, err := r.manageTemplateRevision(ctx, &workload)
-	//if err != nil {
-	//	return ctrl.Result{Requeue: true}, err
-	//}
-
-	// Group Pods by revision hash
-	//podsByRevision, updatedCount, err := groupPodsByTemplateHash(childPods, latestRevision)
-	//if err != nil {
-	//	return ctrl.Result{Requeue: true}, err
-	//}
-
-	// Manage Pods: create/delete based on replicas, partition, and revision
-	//if err := r.managePods(ctx, &workload, podsByRevision, updatedCount, latestRevision); err != nil {
-	//	return ctrl.Result{Requeue: true}, err
-	//}
+	// Manage Pods: create/delete based on replicas, partition, and hash
+	if err := r.managePods(ctx, &workload, childPods.Items, templateHash, log); err != nil {
+		log.Error(err, "Failed to manage pods")
+		return ctrl.Result{Requeue: true}, err
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -112,41 +107,133 @@ func (r *CustomWorkloadReconciler) findChildPods(ctx context.Context, req ctrl.R
 	return childPods, nil
 }
 
-func (r *CustomWorkloadReconciler) managePods(ctx context.Context, workload *appsv1.CustomWorkload, childPods corev1.PodList, log logr.Logger) error {
-	existing := len(childPods.Items)
+func (r *CustomWorkloadReconciler) managePods(ctx context.Context, workload *appsv1.CustomWorkload, allPods []corev1.Pod, newHash string, log logr.Logger) error {
 	desired := int(workload.Spec.Replicas)
+	partition := min(int(workload.Spec.Partition), desired)
+	desiredNew := desired - partition
 
-	// Scale up - create new pods
-	if existing < desired {
-		podsToCreate := desired - existing
-		log.Info("Scaling up pods", "desired", desired, "existing", existing)
-		if err := r.createPods(ctx, workload, podsToCreate); err != nil {
-			log.Error(err, "Failed to create Pods")
-			return err
+	var newPods, oldPods []corev1.Pod
+	var oldHash string
+
+	for _, pod := range allPods {
+		if pod.DeletionTimestamp != nil {
+			// skip terminating pods entirely
+			continue
+		}
+
+		hash := pod.Labels["template-hash"]
+		if hash == newHash {
+			newPods = append(newPods, pod)
+		} else {
+			oldPods = append(oldPods, pod)
+			if oldHash == "" && hash != "" {
+				oldHash = hash
+			}
 		}
 	}
 
-	// Scale down - delete excess pods
-	if existing > desired {
-		podsToDelete := existing - desired
-		log.Info("Scaling down pods", "desired", desired, "existing", existing)
-		if err := r.deletePods(ctx, childPods.Items, podsToDelete); err != nil {
-			log.Error(err, "Failed to delete Pods")
-			return err
-		}
+	log.Info("Managing Pods", "desired", desired, "allPods", len(allPods), "partition", partition, "desiredNew", desiredNew, "newCount", len(newPods), "oldCount", len(oldPods), "newHash", newHash, "oldHash", oldHash)
+
+	// Initial deployment
+	if len(allPods) == 0 {
+		log.Info("Initial deployment: creating all pods", "count", desired)
+		return r.createPods(ctx, workload, desired, newHash)
 	}
 
+	// No template change, scale up/down only
+	if oldHash == "" || oldHash == newHash {
+		return r.handleScalingOnly(ctx, workload, allPods, newHash, desired, log)
+	}
+	if len(newPods) == 0 && allPodsHaveHash(oldPods, newHash) {
+		return r.handleScalingOnly(ctx, workload, allPods, newHash, desired, log)
+	}
+
+	// Template change, perform partitioned rolling update
+	return r.handleRollingUpdate(ctx, workload, newPods, oldPods, newHash, desiredNew, partition, log)
+}
+
+func (r *CustomWorkloadReconciler) handleRollingUpdate(ctx context.Context, workload *appsv1.CustomWorkload, newPods, oldPods []corev1.Pod, newHash string, desiredNew, partition int, log logr.Logger) error {
+	// Filter out terminating pods
+	liveNewPods := filterLivePods(newPods)
+	liveOldPods := filterLivePods(oldPods)
+
+	currentTotal := len(liveNewPods) + len(liveOldPods)
+	desiredTotal := desiredNew + partition
+
+	log.Info("Rolling update state", "liveNewPods", len(liveNewPods), "liveOldPods", len(liveOldPods), "desiredNew", desiredNew, "partition", partition, "currentTotal", currentTotal, "desiredTotal", desiredTotal)
+
+	// Create new pods only if needed
+	if len(liveNewPods) < desiredNew {
+		toCreate := desiredNew - len(liveNewPods)
+		log.Info("Rolling update: creating new pods", "toCreate", toCreate)
+		return r.createPods(ctx, workload, toCreate, newHash)
+	}
+
+	// Only delete old pods beyond the partition if we already have enough new pods
+	if len(liveOldPods) > partition {
+		toDelete := len(liveOldPods) - partition
+		log.Info("Rolling update: deleting old pods beyond partition", "toDelete", toDelete)
+		return r.deletePods(ctx, liveOldPods[:toDelete], toDelete, newHash)
+	}
+
+	// If total exceeds desired, scale down oldest pods
+	if currentTotal > desiredTotal {
+		toDelete := currentTotal - desiredTotal
+		log.Info("Rolling update: scaling down excess pods", "toDelete", toDelete)
+
+		allLivePods := append([]corev1.Pod{}, liveNewPods...)
+		allLivePods = append(allLivePods, liveOldPods...)
+
+		return r.deletePods(ctx, allLivePods, toDelete, newHash)
+	}
+
+	log.Info("Rolling update step completed")
 	return nil
 }
 
-func (r *CustomWorkloadReconciler) createPods(ctx context.Context, workload *appsv1.CustomWorkload, podsToCreate int) error {
-	for podsToCreate > 0 {
+func filterLivePods(pods []corev1.Pod) []corev1.Pod {
+	var result []corev1.Pod
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil {
+			result = append(result, pod)
+		}
+	}
+	return result
+}
+
+func (r *CustomWorkloadReconciler) handleScalingOnly(ctx context.Context, workload *appsv1.CustomWorkload, allPods []corev1.Pod, templateHash string, desired int, log logr.Logger) error {
+	var livePods []corev1.Pod
+	for _, pod := range allPods {
+		if pod.DeletionTimestamp == nil {
+			livePods = append(livePods, pod)
+		}
+	}
+
+	existing := len(livePods)
+	if existing < desired {
+		toCreate := desired - existing
+		log.Info("Scaling up: creating new pods", "count", toCreate)
+		return r.createPods(ctx, workload, toCreate, templateHash)
+	}
+
+	if existing > desired {
+		toDelete := existing - desired
+		log.Info("Scaling down: deleting excess pods", "count", toDelete)
+		return r.deletePods(ctx, livePods, toDelete, "")
+	}
+	log.Info("No scaling needed. Desired count met")
+	return nil
+}
+
+func (r *CustomWorkloadReconciler) createPods(ctx context.Context, workload *appsv1.CustomWorkload, podsToCreate int, templateHash string) error {
+	for i := 0; i < podsToCreate; i++ {
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				GenerateName: workload.Name + "-",
 				Namespace:    workload.Namespace,
 				Labels: map[string]string{
 					"customworkload": workload.Name,
+					"template-hash":  templateHash,
 				},
 			},
 			Spec: workload.Spec.Template.Spec,
@@ -161,19 +248,39 @@ func (r *CustomWorkloadReconciler) createPods(ctx context.Context, workload *app
 			return err
 		}
 		fmt.Println("Created Pod:", pod.Name)
-		podsToCreate--
 	}
 	return nil
 }
 
-func (r *CustomWorkloadReconciler) deletePods(ctx context.Context, childPods []corev1.Pod, podsToDelete int) error {
-	// sort pods by oldest first
-	sort.Slice(childPods, func(i, j int) bool {
-		return childPods[i].CreationTimestamp.Time.Before(childPods[j].CreationTimestamp.Time)
-	})
+func (r *CustomWorkloadReconciler) deletePods(ctx context.Context, childPods []corev1.Pod, podsToDelete int, preferredHash string) error {
+	// Filter out terminating pods
+	var livePods []corev1.Pod
+	for _, pod := range childPods {
+		if pod.DeletionTimestamp == nil {
+			livePods = append(livePods, pod)
+		}
+	}
 
-	// delete the oldest pods first
-	toDelete := childPods[:podsToDelete]
+	// Prioritize deletion of pods not matching the preferred hash (i.e., delete old-hash pods first)
+	if preferredHash != "" {
+		sort.SliceStable(livePods, func(i, j int) bool {
+			iPreferred := livePods[i].Labels["template-hash"] == preferredHash
+			jPreferred := livePods[j].Labels["template-hash"] == preferredHash
+			if iPreferred != jPreferred {
+				return !iPreferred // false < true → keep preferredHash pods last
+			}
+			// delete oldest first
+			return livePods[i].CreationTimestamp.Before(&livePods[j].CreationTimestamp)
+		})
+	} else {
+		// sort by age (oldest first)
+		sort.SliceStable(livePods, func(i, j int) bool {
+			return livePods[i].CreationTimestamp.Before(&livePods[j].CreationTimestamp)
+		})
+	}
+
+	toDelete := livePods[:podsToDelete]
+
 	for _, pod := range toDelete {
 		if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
 			// triggers a DELETE /api/v1/namespaces/default/pods/<name>
@@ -186,6 +293,25 @@ func (r *CustomWorkloadReconciler) deletePods(ctx context.Context, childPods []c
 	}
 
 	return nil
+}
+
+func calculateTemplateHash(spec corev1.PodTemplateSpec) (string, error) {
+	bytes, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(bytes)
+	fullHash := hex.EncodeToString(hash[:])
+	return fullHash[:10], nil
+}
+
+func allPodsHaveHash(pods []corev1.Pod, hash string) bool {
+	for _, pod := range pods {
+		if pod.Labels["template-hash"] != hash {
+			return false
+		}
+	}
+	return true
 }
 
 // SetupWithManager sets up the controller with the Manager.
