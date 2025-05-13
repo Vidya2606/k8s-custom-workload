@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -28,14 +29,36 @@ type CustomWorkloadSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of CustomWorkload. Edit customworkload_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// Replicas is the desired number of pods
+	Replicas int32 `json:"replicas"`
+
+	// Partition determines how many pods should be updated if the template changes
+	Partition int32 `json:"partition,omitempty"`
+
+	// Template defines the pod spec
+	// +kubebuilder:validation:PreserveUnknownFields
+	Template corev1.PodTemplateSpec `json:"template"`
+
+	// RevisionHistoryLimit is the limit on Controller Revision history length
+	RevisionHistoryLimit int32 `json:"revisionHistoryLimit,omitempty"`
 }
 
 // CustomWorkloadStatus defines the observed state of CustomWorkload.
 type CustomWorkloadStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// Number of pods that are ready
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// Number of pods that are updated to the latest spec
+	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
+
+	// Hash or string representing current pod template
+	CurrentRevision string `json:"currentRevision,omitempty"`
+
+	// Hash or string representing the desired update template
+	UpdateRevision string `json:"updateRevision,omitempty"`
 }
 
 // +kubebuilder:object:root=true
